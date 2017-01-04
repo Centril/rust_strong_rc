@@ -1,0 +1,12 @@
+[package]
+name          = "strong_rc"
+version       = "0.1.0"
+authors       = ["Mazdak Farrokhzad <twingoow@gmail.com>"]
+license       = "MIT/Apache-2.0"
+description   = "Reference counting smart pointer without weak count"
+readme        = "README.md"
+keywords      = ["rc", "strong", "smart", "pointers"]
+repository    = "https://github.com/Centril/rust_strong_rc"
+
+[dependencies]
+field-offset = "0.1.1"
