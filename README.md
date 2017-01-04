@@ -4,7 +4,7 @@ This library is an implementation of **strong-only** reference counted smart poi
 can be used as a drop in replacement for that.
 
 [![Build Status](https://travis-ci.org/Centril/rust_strong_rc.svg?branch=master)](https://travis-ci.org/Centril/rust_strong_rc)
-[![Build status](https://ci.appveyor.com/api/projects/status/TODO?svg=true)](https://ci.appveyor.com/project/Centril/rust_strong_rc)
+[![Build status](https://ci.appveyor.com/api/projects/status/1k62lx84j5oflynu?svg=true)](https://ci.appveyor.com/project/Centril/rust_strong_rc)
 [![Crates.io](https://img.shields.io/crates/v/strong_rc.svg?maxAge=2592000)](https://crates.io/crates/strong_rc)
 
 [Documentation](https://docs.rs/strong_rc)
