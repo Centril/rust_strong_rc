@@ -7,6 +7,8 @@ description   = "Reference counting smart pointer without weak count"
 readme        = "README.md"
 keywords      = ["rc", "strong", "smart", "pointers"]
 repository    = "https://github.com/Centril/rust_strong_rc"
+homepage      = "https://github.com/Centril/rust_strong_rc"
+documentation = "https://docs.rs/strong_rc"
 
 [dependencies]
 field-offset = "0.1.1"
