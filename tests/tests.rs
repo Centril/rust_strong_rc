@@ -7,7 +7,6 @@ use strong_rc::Rc;
 use std::boxed::Box;
 use std::mem::drop;
 use std::fmt;
-use std::iter;
 
 #[test]
 fn clone() {
