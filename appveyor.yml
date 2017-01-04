@@ -8,6 +8,8 @@ install:
   - rustc -V
   - cargo -V
 
+build: false
+
 test_script:
   - cargo build
   - cargo test
