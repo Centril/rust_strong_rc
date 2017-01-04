@@ -1,3 +1,5 @@
+extern crate rand;
+
 extern crate strong_rc;
 
 use strong_rc::Rc;
@@ -220,29 +222,64 @@ fn ptr_eq() {
 
     assert!(Rc::ptr_eq(&five, &same_five));
     assert!(!Rc::ptr_eq(&five, &other_five));
+    drop(five);
 }
 
 #[test]
 fn rc_slice() {
-    fn test<T: Copy + PartialEq + fmt::Debug>(val: T, n: usize) {
-        let vec = iter::repeat(val).take(n).collect::<Vec<_>>();
-        let rc  = Rc::<[T]>::from(vec.as_ref());
-        assert_eq!(rc.len(), n);
-        for x in rc.iter() {
-            assert_eq!(*x, val);
+    fn make_rvec<T: Clone + rand::Rand>(n: usize) -> Vec<T> {
+        use rand::Rng;
+        let mut vec: Vec<T> = Vec::with_capacity(n);
+        let mut rng = rand::thread_rng();
+        for _ in 0 .. n {
+            vec.push(rng.gen());
         }
+        vec
+    }
+
+    fn check_all<T: PartialEq + fmt::Debug>(rc: Rc<[T]>, vec: Vec<T>, n: usize) {
+        assert_eq!(rc.len(), n);
+        for (x, v) in rc.iter().zip(vec.into_iter()) {
+            assert_eq!(*x, v);
+        }
+    }
+
+    fn test<T: Copy + PartialEq + fmt::Debug + rand::Rand>(n: usize) {
+        let vec = make_rvec(n);
+        check_all(Rc::<[T]>::from(vec.as_ref()), vec, n);
+    }
+
+    fn testcl<T: Clone + PartialEq + fmt::Debug + rand::Rand>(n: usize) {
+        let vec = make_rvec(n);
+        check_all(Rc::<[T]>::from(vec.as_ref()), vec, n);
     }
 
     #[repr(packed)]
     #[derive(PartialEq, Clone, Copy, Debug)]
     struct Pack(u8, u8, u8);
 
+    #[derive(PartialEq, Clone, Debug)]
+    struct Cl(u8);
+
+    impl rand::Rand for Pack {
+        fn rand<R: rand::Rng>(rng: &mut R) -> Self {
+            Pack(u8::rand(rng), u8::rand(rng), u8::rand(rng))
+        }
+    }
+
+    impl rand::Rand for Cl {
+        fn rand<R: rand::Rng>(rng: &mut R) -> Self {
+            Cl(u8::rand(rng))
+        }
+    }
+
     for n in 0..100 {
-        test::<u8>(8, n);
-        test::<Pack>(Pack(5, 3, 7), n);
-        test::<u16>(16, n);
-        test::<u32>(32, n);
-        test::<u64>(64, n);
-        test::<usize>(64, n);
+        test::<u8>(n);
+        test::<Pack>(n);
+        testcl::<Cl>(n);
+        test::<u16>(n);
+        test::<u32>(n);
+        test::<u64>(n);
+        test::<usize>(n);
     }
 }

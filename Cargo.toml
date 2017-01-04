@@ -12,3 +12,6 @@ documentation = "https://docs.rs/strong_rc"
 
 [dependencies]
 field-offset = "0.1.1"
+
+[dev-dependencies]
+rand = "0.3.15"

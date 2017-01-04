@@ -122,6 +122,7 @@
 #![feature(optin_builtin_traits)]
 #![feature(unsize)]
 #![feature(coerce_unsized)]
+#![feature(specialization)]
 
 #[macro_use]
 extern crate field_offset;
@@ -185,6 +186,7 @@ impl<T> Rc<T> {
     /// use strong_rc::Rc;
     ///
     /// let five = Rc::new(5);
+    /// std::mem::drop(five);
     /// ```
     pub fn new(value: T) -> Rc<T> {
         unsafe {
@@ -574,7 +576,66 @@ impl<T> From<T> for Rc<T> {
     }
 }
 
-impl<'a, T> From<&'a [T]> for Rc<[T]> {
+impl<'a, T: Clone> From<&'a [T]> for Rc<[T]> {
+    /// Constructs a new `Rc<[T]>` from a shared slice [`&[T]`][slice].
+    /// All elements in the slice are copied and the length is exactly that of
+    /// the given [slice].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use strong_rc::Rc;
+    ///
+    /// let arr = [1, 2, 3];
+    /// let rc  = Rc::from(arr);
+    /// assert_eq!(rc.as_ref(), &arr);   // The elements match.
+    /// assert_eq!(rc.len(), arr.len()); // The length is the same.
+    /// ```
+    ///
+    /// Using the [`Into`][Into] trait:
+    ///
+    /// ```
+    /// use strong_rc::Rc;
+    ///
+    /// let arr          = [1, 2, 3];
+    /// let rc: Rc<[u8]> = arr.as_ref().into();
+    /// assert_eq!(rc.as_ref(), &arr);   // The elements match.
+    /// assert_eq!(rc.len(), arr.len()); // The length is the same.
+    /// ```
+    ///
+    /// [Into]: https://doc.rust-lang.org/std/convert/trait.Into.html
+    /// [slice]: https://doc.rust-lang.org/std/primitive.slice.html
+    #[inline]
+    default fn from(slice: &'a [T]) -> Self {
+        // Compute space to allocate for `RcBox<[T]>`.
+        let susize = size_of::<usize>();
+        let aligned_len = 1 + (size_of_val(slice) + susize - 1) / susize;
+
+        unsafe {
+            // Allocate enough space for `RcBox<[T]>`.
+            let ptr = allocate::<usize>(aligned_len);
+
+            // Initialize fields of `RcBox<[T]>`.
+            ptr::write(ptr, 1); // strong: Cell::new(1)
+
+            // "Copy" data.
+            let mut start = ptr.offset(1) as *mut T;
+            for x in slice {
+                ptr::write(start, x.clone());
+                start = start.offset(1);
+            }
+
+            // Combine the allocation address and the string length into a
+            // fat pointer to `RcBox`.
+            let rcbox_ptr: *mut RcBox<[T]> =
+                mem::transmute([ptr as usize, slice.len()]);
+            debug_assert_eq!(aligned_len * susize, size_of_val(&*rcbox_ptr));
+            Rc { ptr: Shared::new(rcbox_ptr) }
+        }
+    }
+}
+
+impl<'a, T: Copy> From<&'a [T]> for Rc<[T]> {
     /// Constructs a new `Rc<[T]>` from a shared slice [`&[T]`][slice].
     /// All elements in the slice are copied and the length is exactly that of
     /// the given [slice].
