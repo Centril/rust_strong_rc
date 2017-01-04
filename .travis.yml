@@ -1,0 +1,14 @@
+language: rust
+rust:
+  - nightly
+matrix:
+  allow_failures:
+    - rust: nightly
+
+notifications:
+  email:
+    on_success: never
+
+os:
+  - linux
+  - osx
