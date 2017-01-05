@@ -134,18 +134,11 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::process::abort;
 use std::marker::{self, Unsize};
-use std::mem::{self, forget, size_of, size_of_val};
+use std::mem::{self, forget, size_of_val};
 use std::ops::{Deref, CoerceUnsized};
 use std::ptr::{self, Shared};
 use std::convert::From;
-
-#[inline(always)]
-unsafe fn allocate<T>(count: usize) -> *mut T {
-    let mut v = Vec::with_capacity(count);
-    let ptr = v.as_mut_ptr();
-    std::mem::forget(v);
-    ptr
-}
+use std::slice;
 
 #[inline(always)]
 unsafe fn deallocate<T>(ptr: *mut T, count: usize) {
@@ -576,9 +569,37 @@ impl<T> From<T> for Rc<T> {
     }
 }
 
+#[inline(always)]
+unsafe fn slice_to_rc<'a, T, U, W, C>(src: &'a [T], cast: C, write_elems: W)
+   -> Rc<U>
+where U: ?Sized,
+      W: FnOnce(&mut [T], &[T]),
+      C: FnOnce(*mut [T]) -> *mut RcBox<U> {
+    // Compute space to allocate for `RcBox<U>`.
+    let susize = mem::size_of::<usize>();
+    let aligned_len = 1 + (mem::size_of_val(src) + susize - 1) / susize;
+
+    // Allocate enough space for `RcBox<U>`.
+    let mut v = Vec::<usize>::with_capacity(aligned_len);
+    let ptr: *mut usize = v.as_mut_ptr();
+    mem::forget(v);
+
+    let dst = |p: *mut usize| slice::from_raw_parts_mut(p as *mut T, src.len());
+
+    // Initialize fields of `RcBox<U>`.
+    ptr::write(ptr, 1);                   // strong: Cell::new(1)
+    write_elems(dst(ptr.offset(1)), src); // value:  T
+
+    // Combine the allocation address and the slice length into a
+    // fat pointer to `RcBox`.
+    let rcbox_ptr = cast(dst(ptr) as *mut [T]);
+    debug_assert_eq!(aligned_len * susize, mem::size_of_val(&*rcbox_ptr));
+    Rc { ptr: Shared::new(rcbox_ptr) }
+}
+
 impl<'a, T: Clone> From<&'a [T]> for Rc<[T]> {
-    /// Constructs a new `Rc<[T]>` from a shared slice [`&[T]`][slice].
-    /// All elements in the slice are copied and the length is exactly that of
+    /// Constructs a new `Rc<[T]>` by cloning all elements from the shared slice
+    /// [`&[T]`][slice]. The length of the reference counted slice will be exactly
     /// the given [slice].
     ///
     /// # Examples
@@ -586,10 +607,13 @@ impl<'a, T: Clone> From<&'a [T]> for Rc<[T]> {
     /// ```
     /// use strong_rc::Rc;
     ///
-    /// let arr = [1, 2, 3];
-    /// let rc  = Rc::from(arr);
+    /// #[derive(PartialEq, Clone, Debug)]
+    /// struct Wrap(u8);
+    ///
+    /// let arr = [Wrap(1), Wrap(2), Wrap(3)];
+    /// let rc: Rc<[Wrap]> = Rc::from(arr.as_ref());
     /// assert_eq!(rc.as_ref(), &arr);   // The elements match.
-    /// assert_eq!(rc.len(), arr.len()); // The length is the same.
+    /// assert_eq!(rc.len(), arr.len()); // The lengths match.
     /// ```
     ///
     /// Using the [`Into`][Into] trait:
@@ -597,40 +621,21 @@ impl<'a, T: Clone> From<&'a [T]> for Rc<[T]> {
     /// ```
     /// use strong_rc::Rc;
     ///
-    /// let arr          = [1, 2, 3];
-    /// let rc: Rc<[u8]> = arr.as_ref().into();
+    /// #[derive(PartialEq, Clone, Debug)]
+    /// struct Wrap(u8);
+    ///
+    /// let arr = [Wrap(1), Wrap(2), Wrap(3)];
+    /// let rc: Rc<[Wrap]> = arr.as_ref().into();
     /// assert_eq!(rc.as_ref(), &arr);   // The elements match.
-    /// assert_eq!(rc.len(), arr.len()); // The length is the same.
+    /// assert_eq!(rc.len(), arr.len()); // The lengths match.
     /// ```
     ///
     /// [Into]: https://doc.rust-lang.org/std/convert/trait.Into.html
     /// [slice]: https://doc.rust-lang.org/std/primitive.slice.html
     #[inline]
     default fn from(slice: &'a [T]) -> Self {
-        // Compute space to allocate for `RcBox<[T]>`.
-        let susize = size_of::<usize>();
-        let aligned_len = 1 + (size_of_val(slice) + susize - 1) / susize;
-
         unsafe {
-            // Allocate enough space for `RcBox<[T]>`.
-            let ptr = allocate::<usize>(aligned_len);
-
-            // Initialize fields of `RcBox<[T]>`.
-            ptr::write(ptr, 1); // strong: Cell::new(1)
-
-            // "Copy" data.
-            let mut start = ptr.offset(1) as *mut T;
-            for x in slice {
-                ptr::write(start, x.clone());
-                start = start.offset(1);
-            }
-
-            // Combine the allocation address and the string length into a
-            // fat pointer to `RcBox`.
-            let rcbox_ptr: *mut RcBox<[T]> =
-                mem::transmute([ptr as usize, slice.len()]);
-            debug_assert_eq!(aligned_len * susize, size_of_val(&*rcbox_ptr));
-            Rc { ptr: Shared::new(rcbox_ptr) }
+            slice_to_rc(slice, |p| p as *mut RcBox<[T]>, <[T]>::clone_from_slice)
         }
     }
 }
@@ -638,7 +643,7 @@ impl<'a, T: Clone> From<&'a [T]> for Rc<[T]> {
 impl<'a, T: Copy> From<&'a [T]> for Rc<[T]> {
     /// Constructs a new `Rc<[T]>` from a shared slice [`&[T]`][slice].
     /// All elements in the slice are copied and the length is exactly that of
-    /// the given [slice].
+    /// the given [slice]. In this case, `T` must be `Copy`.
     ///
     /// # Examples
     ///
@@ -662,30 +667,12 @@ impl<'a, T: Copy> From<&'a [T]> for Rc<[T]> {
     /// assert_eq!(rc.len(), arr.len()); // The length is the same.
     /// ```
     ///
-    /// [Into]: https://doc.rust-lang.org/std/convert/trait.Into.html
-    /// [slice]: https://doc.rust-lang.org/std/primitive.slice.html
+    /// [Into]: ../../std/convert/trait.Into.html
+    /// [slice]: ../../std/primitive.slice.html
     #[inline]
     fn from(slice: &'a [T]) -> Self {
-        // Compute space to allocate for `RcBox<[T]>`.
-        let vptr   = slice.as_ptr();
-        let vlen   = slice.len();
-        let susize = size_of::<usize>();
-        let aligned_len = 1 + (size_of_val(slice) + susize - 1) / susize;
-
         unsafe {
-            // Allocate enough space for `RcBox<[T]>`.
-            let ptr = allocate::<usize>(aligned_len);
-
-            // Initialize fields of `RcBox<[T]>`.
-            ptr::write(ptr, 1); // strong: Cell::new(1)
-            ptr::copy_nonoverlapping(vptr, ptr.offset(1) as *mut T, vlen);
-
-            // Combine the allocation address and the string length into a
-            // fat pointer to `RcBox`.
-            let rcbox_ptr: *mut RcBox<[T]> =
-                mem::transmute([ptr as usize, vlen]);
-            debug_assert_eq!(aligned_len * susize, size_of_val(&*rcbox_ptr));
-            Rc { ptr: Shared::new(rcbox_ptr) }
+            slice_to_rc(slice, |p| p as *mut RcBox<[T]>, <[T]>::copy_from_slice)
         }
     }
 }
@@ -716,10 +703,57 @@ impl<'a> From<&'a str> for Rc<str> {
     /// assert_eq!(rc.len(), slice.len()); // The length is the same.
     /// ```
     ///
-    /// [Into]: https://doc.rust-lang.org/std/convert/trait.Into.html
-    /// [string slice]: https://doc.rust-lang.org/std/primitive.str.html
-    fn from(value: &'a str) -> Self {
-        unsafe { mem::transmute(Rc::<[u8]>::from(value.as_bytes())) }
+    /// This can be useful in doing [string interning], and cache:ing your strings.
+    ///
+    /// ```
+    /// // For Rc::ptr_eq
+    /// #![feature(ptr_eq)]
+    ///
+    /// use strong_rc::Rc;
+    ///
+    /// use std::collections::HashSet;
+    /// use std::mem::drop;
+    ///
+    /// fn cache_str(cache: &mut HashSet<Rc<str>>, input: &str) -> Rc<str> {
+    ///     // If the input hasn't been cached, do it:
+    ///     if !cache.contains(input) {
+    ///         cache.insert(input.into());
+    ///     }
+    ///
+    ///     // Retrieve the cached element.
+    ///     cache.get(input).unwrap().clone()
+    /// }
+    ///
+    /// let first   = "hello world!";
+    /// let second  = "goodbye!";
+    /// let mut set = HashSet::new();
+    ///
+    /// // Cache the slices:
+    /// let rc_first  = cache_str(&mut set, first);
+    /// let rc_second = cache_str(&mut set, second);
+    /// let rc_third  = cache_str(&mut set, second);
+    ///
+    /// // The contents match:
+    /// assert_eq!(rc_first.as_ref(),  first);
+    /// assert_eq!(rc_second.as_ref(), second);
+    /// assert_eq!(rc_third.as_ref(),  rc_second.as_ref());
+    ///
+    /// // It was cached:
+    /// assert_eq!(set.len(), 2);
+    /// drop(set);
+    /// assert_eq!(Rc::strong_count(&rc_first),  1);
+    /// assert_eq!(Rc::strong_count(&rc_second), 2);
+    /// assert_eq!(Rc::strong_count(&rc_third),  2);
+    /// assert!(Rc::ptr_eq(&rc_second, &rc_third));
+    ///
+    /// [string interning]: https://en.wikipedia.org/wiki/String_interning
+    fn from(slice: &'a str) -> Self {
+        // This is safe since the input was valid utf8 to begin with, and thus
+        // the invariants hold.
+        unsafe {
+            let bytes = slice.as_bytes();
+            slice_to_rc(bytes, |p| p as *mut RcBox<str>, <[u8]>::copy_from_slice)
+        }
     }
 }
 
