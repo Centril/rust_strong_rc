@@ -139,6 +139,7 @@ use std::ops::{Deref, CoerceUnsized};
 use std::ptr::{self, Shared};
 use std::convert::From;
 use std::slice;
+use std::vec::Vec;
 
 #[inline(always)]
 unsafe fn deallocate<T>(ptr: *mut T, count: usize) {
@@ -574,27 +575,62 @@ unsafe fn slice_to_rc<'a, T, U, W, C>(src: &'a [T], cast: C, write_elems: W)
    -> Rc<U>
 where U: ?Sized,
       W: FnOnce(&mut [T], &[T]),
-      C: FnOnce(*mut [T]) -> *mut RcBox<U> {
+      C: FnOnce(*mut RcBox<[T]>) -> *mut RcBox<U> {
     // Compute space to allocate for `RcBox<U>`.
     let susize = mem::size_of::<usize>();
     let aligned_len = 1 + (mem::size_of_val(src) + susize - 1) / susize;
 
-    // Allocate enough space for `RcBox<U>`.
+    // Allocate the space.
     let mut v = Vec::<usize>::with_capacity(aligned_len);
     let ptr: *mut usize = v.as_mut_ptr();
     mem::forget(v);
 
-    let dst = |p: *mut usize| slice::from_raw_parts_mut(p as *mut T, src.len());
-
-    // Initialize fields of `RcBox<U>`.
-    ptr::write(ptr, 1);                   // strong: Cell::new(1)
-    write_elems(dst(ptr.offset(1)), src); // value:  T
-
     // Combine the allocation address and the slice length into a
-    // fat pointer to `RcBox`.
-    let rcbox_ptr = cast(dst(ptr) as *mut [T]);
+    // fat pointer to RcBox<[T]>.
+    let rbp = slice::from_raw_parts_mut(ptr as *mut T, src.len())
+                as *mut [T] as *mut RcBox<[T]>;
+
+    // Initialize fields of RcBox<[T]>.
+    (*rbp).strong.set(1);
+    write_elems(&mut (*rbp).value, src);
+
+    // Recast to RcBox<U> and yield the Rc:
+    let rcbox_ptr = cast(rbp);
     debug_assert_eq!(aligned_len * susize, mem::size_of_val(&*rcbox_ptr));
     Rc { ptr: Shared::new(rcbox_ptr) }
+}
+
+impl<T> From<Vec<T>> for Rc<[T]> {
+    /// Constructs a new `Rc<[T]>` from a `Vec<T>`.
+    /// The allocated space of the `Vec<T>` is not reused,
+    /// but new space is allocated and the old is deallocated.
+    /// This happens due to the internal layout of `Rc`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use strong_rc::Rc;
+    ///
+    /// let arr = [1, 2, 3];
+    /// let vec = vec![Box::new(1), Box::new(2), Box::new(3)];
+    /// let rc: Rc<[Box<usize>]> = Rc::from(vec);
+    /// assert_eq!(rc.len(), arr.len());
+    /// for (x, y) in rc.iter().zip(&arr) {
+    ///     assert_eq!(**x, *y);
+    /// }
+    /// ```
+    #[inline]
+    fn from(mut vec: Vec<T>) -> Self {
+        unsafe {
+            let rc = slice_to_rc(vec.as_slice(), |p| p, |dst, src|
+                ptr::copy_nonoverlapping(
+                    src.as_ptr(), dst.as_mut_ptr(), src.len())
+            );
+            // Prevent vec from trying to drop the elements:
+            vec.set_len(0);
+            rc
+        }
+    }
 }
 
 impl<'a, T: Clone> From<&'a [T]> for Rc<[T]> {
@@ -635,7 +671,11 @@ impl<'a, T: Clone> From<&'a [T]> for Rc<[T]> {
     #[inline]
     default fn from(slice: &'a [T]) -> Self {
         unsafe {
-            slice_to_rc(slice, |p| p as *mut RcBox<[T]>, <[T]>::clone_from_slice)
+            slice_to_rc(slice, |p| p, |dst, src| {
+                for (d, s) in dst.iter_mut().zip(src) {
+                    ptr::write(d, s.clone())
+                }
+            })
         }
     }
 }
@@ -672,7 +712,7 @@ impl<'a, T: Copy> From<&'a [T]> for Rc<[T]> {
     #[inline]
     fn from(slice: &'a [T]) -> Self {
         unsafe {
-            slice_to_rc(slice, |p| p as *mut RcBox<[T]>, <[T]>::copy_from_slice)
+            slice_to_rc(slice, |p| p, <[T]>::copy_from_slice)
         }
     }
 }
