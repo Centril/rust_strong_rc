@@ -15,7 +15,7 @@ First, add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-strong_rc = "0.1.3"
+strong_rc = "0.1.4"
 ```
 
 Next, add this to your crate:
