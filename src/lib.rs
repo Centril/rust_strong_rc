@@ -120,12 +120,12 @@
 #![feature(shared)]
 #![feature(process_abort)]
 #![feature(optin_builtin_traits)]
-#![feature(unsize)]
-#![feature(coerce_unsized)]
+#![feature(unsize, coerce_unsized)]
 #![feature(specialization)]
+#![feature(alloc, heap_api)]
 
-#[macro_use]
-extern crate field_offset;
+extern crate alloc;
+use alloc::heap;
 
 use std::borrow;
 use std::cell::Cell;
@@ -140,6 +140,26 @@ use std::ptr::{self, Shared};
 use std::convert::From;
 use std::slice;
 use std::vec::Vec;
+use std::cmp;
+
+macro_rules! offset_of {
+    ($typ:ty , $field:ident) => (
+        unsafe {
+            offset_of_unsafe!($typ, $field)
+        }
+    );
+}
+
+macro_rules! offset_of_unsafe {
+    ($typ:ty , $field:ident) => ({
+        // NOTE: technically, a dereference of a null pointer.
+        // We only ever make a raw pointer out of the lvalue, however,
+        // so it's fine.
+        let x: *const $typ = mem::zeroed();
+        (&(*x).$field as *const _ as *const u8 as usize)
+        - (x as *const u8 as usize)
+    });
+}
 
 #[inline(always)]
 unsafe fn deallocate<T>(ptr: *mut T, count: usize) {
@@ -289,7 +309,7 @@ impl<T> Rc<T> {
         // To find the corresponding pointer to the `RcBox` we need to subtract
         // the offset of the `value` field from the pointer.
         #[allow(unused_unsafe)]
-        let offset = offset_of!(RcBox<T> => value).get_byte_offset();
+        let offset = offset_of!(RcBox<T>, value);
         let rcbox = (ptr as *mut u8).offset(-(offset as isize)) as *mut _;
         Rc { ptr: Shared::new(rcbox) }
     }
@@ -567,6 +587,63 @@ impl<T: Default> Default for Rc<T> {
 impl<T> From<T> for Rc<T> {
     fn from(t: T) -> Self {
         Rc::new(t)
+    }
+}
+
+impl<T: ?Sized> From<Box<T>> for Rc<T> {
+    /// Constructs a new `Rc<T>` from a `Box<T>` where `T` can be unsized.
+    /// The allocated space of the `Box<T>` is not reused,
+    /// but new space is allocated and the old is deallocated.
+    /// This happens due to the internal layout of `Rc`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use strong_rc::Rc;
+    ///
+    /// let arr = [1, 2, 3];
+    /// let vec = vec![Box::new(1), Box::new(2), Box::new(3)].into_boxed_slice();
+    /// let rc: Rc<[Box<usize>]> = Rc::from(vec);
+    /// assert_eq!(rc.len(), arr.len());
+    /// for (x, y) in rc.iter().zip(&arr) {
+    ///     assert_eq!(**x, *y);
+    /// }
+    /// ```
+    #[inline]
+    fn from(boxed: Box<T>) -> Self {
+        unsafe {
+            // Compute space to allocate + alignment for `RcBox<T>`.
+            let sizeb  = mem::size_of_val(&*boxed);
+            let alignb = mem::align_of_val(&*boxed);
+            let align  = cmp::max(alignb, mem::align_of::<usize>());
+            let size   = offset_of_unsafe!(RcBox<T>, value) + sizeb;
+
+            // Allocate the space.
+            let alloc  = heap::allocate(size, align);
+
+            // Cast to fat pointer: *mut RcBox<T>.
+            let bptr      = Box::into_raw(boxed);
+            let rcbox_ptr = {
+                let mut tmp = bptr;
+                ptr::write(&mut tmp as *mut _ as *mut * mut u8, alloc);
+                tmp as *mut RcBox<T>
+            };
+
+            // Initialize fields of RcBox<T>.
+            (*rcbox_ptr).strong.set(1);
+            //(*rcbox_ptr).weak.set(1);
+            ptr::copy_nonoverlapping(
+                bptr as *const u8,
+                (&mut (*rcbox_ptr).value) as *mut T as *mut u8,
+                sizeb);
+
+            // Deallocate box, we've already forgotten it.
+            heap::deallocate(bptr as *mut u8, sizeb, alignb);
+
+            // Yield the Rc:
+            debug_assert_eq!(size, mem::size_of_val(&*rcbox_ptr));
+            Rc { ptr: Shared::new(rcbox_ptr) }
+        }
     }
 }
 
