@@ -118,7 +118,6 @@
 //! ```
 
 #![feature(shared)]
-#![feature(process_abort)]
 #![feature(optin_builtin_traits)]
 #![feature(unsize, coerce_unsized)]
 #![feature(specialization)]
