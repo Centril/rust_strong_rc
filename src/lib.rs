@@ -132,9 +132,7 @@ use std::marker::{PhantomData, Unsize};
 use std::mem::{self, forget, size_of_val};
 use std::ops::{Deref, CoerceUnsized};
 use std::ptr::{self, NonNull};
-use std::convert::From;
 use std::slice;
-use std::vec::Vec;
 
 macro_rules! offset_of {
     ($typ:ty , $field:ident) => (
