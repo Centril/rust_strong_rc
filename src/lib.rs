@@ -119,11 +119,9 @@
 
 #![feature(unsize, coerce_unsized)]
 #![feature(specialization)]
-#![feature(alloc, heap_api)]
+#![feature(allocator_api)]
 
-extern crate alloc;
-use alloc::heap;
-
+use std::alloc::{self, Layout};
 use std::borrow;
 use std::cell::Cell;
 use std::cmp::Ordering;
@@ -137,7 +135,6 @@ use std::ptr::{self, NonNull};
 use std::convert::From;
 use std::slice;
 use std::vec::Vec;
-use std::cmp;
 
 macro_rules! offset_of {
     ($typ:ty , $field:ident) => (
@@ -609,13 +606,13 @@ impl<T: ?Sized> From<Box<T>> for Rc<T> {
     fn from(boxed: Box<T>) -> Self {
         unsafe {
             // Compute space to allocate + alignment for `RcBox<T>`.
-            let sizeb  = mem::size_of_val(&*boxed);
-            let alignb = mem::align_of_val(&*boxed);
-            let align  = cmp::max(alignb, mem::align_of::<usize>());
-            let size   = offset_of_unsafe!(RcBox<T>, value) + sizeb;
+            let box_layout = Layout::for_value(&*boxed);
+            let (rcbox_layout, _) = Layout::new::<Cell<usize>>()
+                .extend(box_layout)
+                .unwrap_or_else(|_| unreachable!() );
 
             // Allocate the space.
-            let alloc  = heap::allocate(size, align);
+            let alloc  = alloc::alloc(rcbox_layout);
 
             // Cast to fat pointer: *mut RcBox<T>.
             let bptr      = Box::into_raw(boxed);
@@ -631,13 +628,13 @@ impl<T: ?Sized> From<Box<T>> for Rc<T> {
             ptr::copy_nonoverlapping(
                 bptr as *const u8,
                 (&mut (*rcbox_ptr).value) as *mut T as *mut u8,
-                sizeb);
+                box_layout.size());
 
             // Deallocate box, we've already forgotten it.
-            heap::deallocate(bptr as *mut u8, sizeb, alignb);
+            alloc::dealloc(bptr as *mut u8, box_layout);
 
             // Yield the Rc:
-            debug_assert_eq!(size, mem::size_of_val(&*rcbox_ptr));
+            debug_assert_eq!(rcbox_layout.size(), mem::size_of_val(&*rcbox_ptr));
             Rc {
                 ptr: NonNull::new_unchecked(rcbox_ptr),
                 phantom: PhantomData,
