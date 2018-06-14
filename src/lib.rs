@@ -712,6 +712,9 @@ impl<'a, T: Clone> From<&'a [T]> for Rc<[T]> {
     /// [`&[T]`][slice]. The length of the reference counted slice will be exactly
     /// the given [slice].
     ///
+    /// If a call to `clone()` unwinds, already cloned elements and the memory
+    /// for the `Rc` might not be dropped.
+    ///
     /// # Examples
     ///
     /// ```

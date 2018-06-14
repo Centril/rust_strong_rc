@@ -1,7 +1,7 @@
 # strong_rc
 
 This library is an implementation of **strong-only** reference counted smart pointers in Rust. All applicable methods have identical names as in [`std::rc`], and so this
-can be used as a drop in replacement for that.
+can be used as a drop in replacement for that. Requires nightly Rust.
 
 [![Build Status](https://travis-ci.org/Centril/rust_strong_rc.svg?branch=master)](https://travis-ci.org/Centril/rust_strong_rc)
 [![Build status](https://ci.appveyor.com/api/projects/status/1k62lx84j5oflynu?svg=true)](https://ci.appveyor.com/project/Centril/rust_strong_rc)
