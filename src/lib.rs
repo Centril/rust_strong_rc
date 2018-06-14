@@ -822,9 +822,6 @@ impl<'a> From<&'a str> for Rc<str> {
     /// This can be useful in doing [string interning], and cache:ing your strings.
     ///
     /// ```
-    /// // For Rc::ptr_eq
-    /// #![feature(ptr_eq)]
-    ///
     /// use strong_rc::Rc;
     ///
     /// use std::collections::HashSet;
@@ -861,6 +858,7 @@ impl<'a> From<&'a str> for Rc<str> {
     /// assert_eq!(Rc::strong_count(&rc_second), 2);
     /// assert_eq!(Rc::strong_count(&rc_third),  2);
     /// assert!(Rc::ptr_eq(&rc_second, &rc_third));
+    /// ```
     ///
     /// [string interning]: https://en.wikipedia.org/wiki/String_interning
     fn from(slice: &'a str) -> Self {
