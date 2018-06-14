@@ -117,8 +117,6 @@
 //! }
 //! ```
 
-#![feature(shared)]
-#![feature(optin_builtin_traits)]
 #![feature(unsize, coerce_unsized)]
 #![feature(specialization)]
 #![feature(alloc, heap_api)]
@@ -132,10 +130,10 @@ use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::process::abort;
-use std::marker::{self, Unsize};
+use std::marker::{PhantomData, Unsize};
 use std::mem::{self, forget, size_of_val};
 use std::ops::{Deref, CoerceUnsized};
-use std::ptr::{self, Shared};
+use std::ptr::{self, NonNull};
 use std::convert::From;
 use std::slice;
 use std::vec::Vec;
@@ -180,11 +178,9 @@ struct RcBox<T: ?Sized> {
 /// `value.get_mut()`.  This avoids conflicts with methods of the inner
 /// type `T`.
 pub struct Rc<T: ?Sized> {
-    ptr: Shared<RcBox<T>>,
+    ptr: NonNull<RcBox<T>>,
+    phantom: PhantomData<T>,
 }
-
-impl<T: ?Sized> !marker::Send for Rc<T> {}
-impl<T: ?Sized> !marker::Sync for Rc<T> {}
 
 impl<T, U> CoerceUnsized<Rc<U>> for Rc<T>
 where T: ?Sized + Unsize<U>,
@@ -209,7 +205,8 @@ impl<T> Rc<T> {
             };
 
             Rc {
-                ptr: Shared::new(Box::into_raw(Box::new(inner))),
+                ptr: NonNull::new_unchecked(Box::into_raw(Box::new(inner))),
+                phantom: PhantomData,
             }
         }
     }
@@ -271,7 +268,7 @@ impl<T> Rc<T> {
     /// assert_eq!(unsafe { *x_ptr }, 10);
     /// ```
     pub fn into_raw(this: Self) -> *mut T {
-        let ptr = unsafe { &mut (**this.ptr).value as *mut _ };
+        let ptr = unsafe { &this.ptr.as_ref().value as *const _ as *mut _ };
         mem::forget(this);
         ptr
     }
@@ -310,7 +307,10 @@ impl<T> Rc<T> {
         #[allow(unused_unsafe)]
         let offset = offset_of!(RcBox<T>, value);
         let rcbox = (ptr as *mut u8).offset(-(offset as isize)) as *mut _;
-        Rc { ptr: Shared::new(rcbox) }
+        Rc {
+            ptr: NonNull::new_unchecked(rcbox),
+            phantom: PhantomData,
+        }
     }
 }
 
@@ -334,7 +334,7 @@ impl<T: ?Sized> Rc<T> {
             // manipulated the reference count in the same function.
             assume(!(*(&self.ptr as *const _ as *const *const ())).is_null());
             */
-            &(**self.ptr)
+            self.ptr.as_ref()
         }
     }
 
@@ -408,7 +408,7 @@ impl<T: ?Sized> Rc<T> {
     #[inline]
     pub fn get_mut(this: &mut Self) -> Option<&mut T> {
         if Rc::is_unique(this) {
-            let inner = unsafe { &mut **this.ptr };
+            let inner = unsafe { this.ptr.as_mut() };
             Some(&mut inner.value)
         } else {
             None
@@ -432,9 +432,7 @@ impl<T: ?Sized> Rc<T> {
     /// ```
     #[inline]
     pub fn ptr_eq(this: &Self, other: &Self) -> bool {
-        let this_ptr:  *const RcBox<T> = *this.ptr;
-        let other_ptr: *const RcBox<T> = *other.ptr;
-        this_ptr == other_ptr
+        this.ptr == other.ptr
     }
 }
 
@@ -479,8 +477,7 @@ impl<T: Clone> Rc<T> {
         // reference count is guaranteed to be 1 at this point, and we required
         // the `Rc<T>` itself to be `mut`, so we're returning the only possible
         // reference to the inner value.
-        let inner = unsafe { &mut **this.ptr };
-        &mut inner.value
+        unsafe { &mut this.ptr.as_mut().value }
     }
 }
 
@@ -532,7 +529,7 @@ impl<T: ?Sized> Drop for Rc<T> {
     /// ```
     fn drop(&mut self) {
         unsafe {
-            let ptr: *mut RcBox<T> = *self.ptr;
+            let ptr: *mut RcBox<T> = self.ptr.as_ptr();
             self.dec_strong();
             if self.strong() == 0 {
                 // run destructor of value.
@@ -562,7 +559,7 @@ impl<T: ?Sized> Clone for Rc<T> {
     #[inline]
     fn clone(&self) -> Rc<T> {
         self.inc_strong();
-        Rc { ptr: self.ptr }
+        Rc { ptr: self.ptr, phantom: PhantomData }
     }
 }
 
@@ -641,7 +638,10 @@ impl<T: ?Sized> From<Box<T>> for Rc<T> {
 
             // Yield the Rc:
             debug_assert_eq!(size, mem::size_of_val(&*rcbox_ptr));
-            Rc { ptr: Shared::new(rcbox_ptr) }
+            Rc {
+                ptr: NonNull::new_unchecked(rcbox_ptr),
+                phantom: PhantomData,
+            }
         }
     }
 }
@@ -673,7 +673,10 @@ where U: ?Sized,
     // Recast to RcBox<U> and yield the Rc:
     let rcbox_ptr = cast(rbp);
     debug_assert_eq!(aligned_len * susize, mem::size_of_val(&*rcbox_ptr));
-    Rc { ptr: Shared::new(rcbox_ptr) }
+    Rc {
+        ptr: NonNull::new_unchecked(rcbox_ptr),
+        phantom: PhantomData
+    }
 }
 
 impl<T> From<Vec<T>> for Rc<[T]> {
@@ -1047,6 +1050,24 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for Rc<T> {
 
 impl<T: ?Sized> fmt::Pointer for Rc<T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        fmt::Pointer::fmt(&*self.ptr, f)
+        fmt::Pointer::fmt(&self.ptr, f)
     }
 }
+
+/// A hidden place for negative trait tests.
+///
+/// !Sync:
+/// ```compile_fail
+/// use strong_rc::Rc;
+/// fn sync<T:Sync>(_: T) {}
+/// sync(Rc::new(()));
+/// ```
+///
+/// !Send:
+/// ```compile_fail
+/// use strong_rc::Rc;
+/// fn send<T:Send>(_: T) {}
+/// send(Rc::new(()));
+/// ```
+#[allow(unused)]
+struct ThreadsafeTest;
