@@ -129,34 +129,9 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::process::abort;
 use std::marker::{PhantomData, Unsize};
-use std::mem::{self, forget, size_of_val};
+use std::mem::{self, forget, size_of_val, align_of_val};
 use std::ops::{Deref, CoerceUnsized};
 use std::ptr::{self, NonNull};
-use std::slice;
-
-macro_rules! offset_of {
-    ($typ:ty , $field:ident) => (
-        unsafe {
-            offset_of_unsafe!($typ, $field)
-        }
-    );
-}
-
-macro_rules! offset_of_unsafe {
-    ($typ:ty , $field:ident) => ({
-        // NOTE: technically, a dereference of a null pointer.
-        // We only ever make a raw pointer out of the lvalue, however,
-        // so it's fine.
-        let x: *const $typ = mem::zeroed();
-        (&(*x).$field as *const _ as *const u8 as usize)
-        - (x as *const u8 as usize)
-    });
-}
-
-#[inline(always)]
-unsafe fn deallocate<T>(ptr: *mut T, count: usize) {
-    std::mem::drop(Vec::from_raw_parts(ptr, 0, count));
-}
 
 #[repr(C)]
 struct RcBox<T: ?Sized> {
@@ -180,6 +155,11 @@ pub struct Rc<T: ?Sized> {
 impl<T, U> CoerceUnsized<Rc<U>> for Rc<T>
 where T: ?Sized + Unsize<U>,
       U: ?Sized {}
+
+unsafe fn set_ptr<T:?Sized>(mut fat: *const T,  alloc: *mut u8) -> *mut RcBox<T> {
+    ptr::write(&mut fat as *mut *const T as *mut *const u8, alloc);
+    fat as *mut RcBox<T>
+}
 
 impl<T> Rc<T> {
     /// Constructs a new `Rc<T>`.
@@ -297,13 +277,17 @@ impl<T> Rc<T> {
     /// // The memory was freed when `x` went out of scope above, so `x_ptr` is now dangling!
     /// ```
     pub unsafe fn from_raw(ptr: *mut T) -> Self {
-        // To find the corresponding pointer to the `RcBox` we need to subtract
-        // the offset of the `value` field from the pointer.
-        #[allow(unused_unsafe)]
-        let offset = offset_of!(RcBox<T>, value);
-        let rcbox = (ptr as *mut u8).offset(-(offset as isize)) as *mut _;
+        // Align the unsized value to the end of the RcBox.
+        // Because it is ?Sized, it will always be the last field in memory.
+        let align = align_of_val(&*ptr);
+        let layout = Layout::new::<RcBox<()>>();
+        let offset = (layout.size() + layout.padding_needed_for(align)) as isize;
+
+        // Reverse the offset to find the original RcBox.
+        let rcbox_ptr = set_ptr(ptr as *const T, (ptr as *mut u8).offset(-offset));
+
         Rc {
-            ptr: NonNull::new_unchecked(rcbox),
+            ptr: NonNull::new_unchecked(rcbox_ptr),
             phantom: PhantomData,
         }
     }
@@ -497,6 +481,15 @@ impl<T: ?Sized> AsRef<T> for Rc<T> {
     }
 }
 
+#[inline(never)]
+unsafe fn slow_drop<T:?Sized>(ptr: *mut RcBox<T>) {
+    let layout = Layout::for_value(&*ptr);
+    // run destructor of value.
+    ptr::drop_in_place(&mut(*ptr).value);
+    // deallocate the heap allocated memory.
+    alloc::dealloc(ptr as *mut u8, layout);
+}
+
 impl<T: ?Sized> Drop for Rc<T> {
     /// Drops the `Rc`.
     ///
@@ -522,15 +515,12 @@ impl<T: ?Sized> Drop for Rc<T> {
     /// drop(foo);    // Doesn't print anything
     /// drop(foo2);   // Prints "dropped!"
     /// ```
+    #[inline]
     fn drop(&mut self) {
         unsafe {
-            let ptr: *mut RcBox<T> = self.ptr.as_ptr();
             self.dec_strong();
             if self.strong() == 0 {
-                // run destructor of value.
-                ptr::drop_in_place(&mut (*ptr).value);
-                // deallocate the heap allocated memory.
-                deallocate(ptr as *mut u8, size_of_val(&*ptr))
+                slow_drop(self.ptr.as_ptr());
             }
         }
     }
@@ -604,31 +594,25 @@ impl<T: ?Sized> From<Box<T>> for Rc<T> {
     fn from(boxed: Box<T>) -> Self {
         unsafe {
             // Compute space to allocate + alignment for `RcBox<T>`.
-            let box_layout = Layout::for_value(&*boxed);
-            let (rcbox_layout, _) = Layout::new::<Cell<usize>>()
-                .extend(box_layout)
-                .unwrap_or_else(|_| unreachable!() );
+            let fake_rcbox_ptr = &*boxed as *const T as *const RcBox<T>;
+            let rcbox_layout = Layout::for_value(&*fake_rcbox_ptr);
 
             // Allocate the space.
             let alloc  = alloc::alloc(rcbox_layout);
 
             // Cast to fat pointer: *mut RcBox<T>.
             let bptr      = Box::into_raw(boxed);
-            let rcbox_ptr = {
-                let mut tmp = bptr;
-                ptr::write(&mut tmp as *mut _ as *mut * mut u8, alloc);
-                tmp as *mut RcBox<T>
-            };
+            let rcbox_ptr = set_ptr(bptr as *const T, alloc);
 
             // Initialize fields of RcBox<T>.
             (*rcbox_ptr).strong.set(1);
-            //(*rcbox_ptr).weak.set(1);
+            let box_layout = Layout::for_value(&*bptr);
             ptr::copy_nonoverlapping(
                 bptr as *const u8,
                 (&mut (*rcbox_ptr).value) as *mut T as *mut u8,
                 box_layout.size());
 
-            // Deallocate box, we've already forgotten it.
+            // Deallocate box, Box::into_raw consumed it and we've moved the value
             alloc::dealloc(bptr as *mut u8, box_layout);
 
             // Yield the Rc:
@@ -647,27 +631,25 @@ unsafe fn slice_to_rc<'a, T, U, W, C>(src: &'a [T], cast: C, write_elems: W)
 where U: ?Sized,
       W: FnOnce(&mut [T], &[T]),
       C: FnOnce(*mut RcBox<[T]>) -> *mut RcBox<U> {
-    // Compute space to allocate for `RcBox<U>`.
-    let susize = mem::size_of::<usize>();
-    let aligned_len = 1 + (mem::size_of_val(src) + susize - 1) / susize;
+    // Compute space to allocate for `RcBox<U>` by creating a fake pointer.
+    // (this is how std does it)
+    let fake_rcbox_ptr = src as *const [T] as *const RcBox<[T]>;
+    let layout = Layout::for_value(&*fake_rcbox_ptr);
 
     // Allocate the space.
-    let mut v = Vec::<usize>::with_capacity(aligned_len);
-    let ptr: *mut usize = v.as_mut_ptr();
-    mem::forget(v);
+    let alloc: *mut u8 = alloc::alloc(layout);
 
     // Combine the allocation address and the slice length into a
     // fat pointer to RcBox<[T]>.
-    let rbp = slice::from_raw_parts_mut(ptr as *mut T, src.len())
-                as *mut [T] as *mut RcBox<[T]>;
+    let rcbox_ptr = set_ptr(src as *const [T], alloc);
 
     // Initialize fields of RcBox<[T]>.
-    (*rbp).strong.set(1);
-    write_elems(&mut (*rbp).value, src);
+    (*rcbox_ptr).strong.set(1);
+    write_elems(&mut (*rcbox_ptr).value, src);
 
-    // Recast to RcBox<U> and yield the Rc:
-    let rcbox_ptr = cast(rbp);
-    debug_assert_eq!(aligned_len * susize, mem::size_of_val(&*rcbox_ptr));
+    // cast to the final type (either [T] or str)
+    let rcbox_ptr = cast(rcbox_ptr);
+    debug_assert_eq!(layout.size(), size_of_val(&*rcbox_ptr));
     Rc {
         ptr: NonNull::new_unchecked(rcbox_ptr),
         phantom: PhantomData
