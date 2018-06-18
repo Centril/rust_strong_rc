@@ -4,8 +4,6 @@ extern crate strong_rc;
 
 use strong_rc::Rc;
 
-use std::boxed::Box;
-use std::mem::drop;
 use std::fmt;
 
 #[test]

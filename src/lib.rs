@@ -117,54 +117,21 @@
 //! }
 //! ```
 
-#![feature(shared)]
-#![feature(process_abort)]
-#![feature(optin_builtin_traits)]
 #![feature(unsize, coerce_unsized)]
 #![feature(specialization)]
-#![feature(alloc, heap_api)]
+#![feature(allocator_api)]
 
-extern crate alloc;
-use alloc::heap;
-
+use std::alloc::{self, Layout};
 use std::borrow;
 use std::cell::Cell;
 use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::process::abort;
-use std::marker::{self, Unsize};
-use std::mem::{self, forget, size_of_val};
+use std::marker::{PhantomData, Unsize};
+use std::mem::{self, forget, size_of_val, align_of_val};
 use std::ops::{Deref, CoerceUnsized};
-use std::ptr::{self, Shared};
-use std::convert::From;
-use std::slice;
-use std::vec::Vec;
-use std::cmp;
-
-macro_rules! offset_of {
-    ($typ:ty , $field:ident) => (
-        unsafe {
-            offset_of_unsafe!($typ, $field)
-        }
-    );
-}
-
-macro_rules! offset_of_unsafe {
-    ($typ:ty , $field:ident) => ({
-        // NOTE: technically, a dereference of a null pointer.
-        // We only ever make a raw pointer out of the lvalue, however,
-        // so it's fine.
-        let x: *const $typ = mem::zeroed();
-        (&(*x).$field as *const _ as *const u8 as usize)
-        - (x as *const u8 as usize)
-    });
-}
-
-#[inline(always)]
-unsafe fn deallocate<T>(ptr: *mut T, count: usize) {
-    std::mem::drop(Vec::from_raw_parts(ptr, 0, count));
-}
+use std::ptr::{self, NonNull};
 
 #[repr(C)]
 struct RcBox<T: ?Sized> {
@@ -181,15 +148,18 @@ struct RcBox<T: ?Sized> {
 /// `value.get_mut()`.  This avoids conflicts with methods of the inner
 /// type `T`.
 pub struct Rc<T: ?Sized> {
-    ptr: Shared<RcBox<T>>,
+    ptr: NonNull<RcBox<T>>,
+    phantom: PhantomData<T>,
 }
-
-impl<T: ?Sized> !marker::Send for Rc<T> {}
-impl<T: ?Sized> !marker::Sync for Rc<T> {}
 
 impl<T, U> CoerceUnsized<Rc<U>> for Rc<T>
 where T: ?Sized + Unsize<U>,
       U: ?Sized {}
+
+unsafe fn set_ptr<T:?Sized>(mut fat: *const T,  alloc: *mut u8) -> *mut RcBox<T> {
+    ptr::write(&mut fat as *mut *const T as *mut *const u8, alloc);
+    fat as *mut RcBox<T>
+}
 
 impl<T> Rc<T> {
     /// Constructs a new `Rc<T>`.
@@ -210,7 +180,8 @@ impl<T> Rc<T> {
             };
 
             Rc {
-                ptr: Shared::new(Box::into_raw(Box::new(inner))),
+                ptr: NonNull::new_unchecked(Box::into_raw(Box::new(inner))),
+                phantom: PhantomData,
             }
         }
     }
@@ -272,7 +243,7 @@ impl<T> Rc<T> {
     /// assert_eq!(unsafe { *x_ptr }, 10);
     /// ```
     pub fn into_raw(this: Self) -> *mut T {
-        let ptr = unsafe { &mut (**this.ptr).value as *mut _ };
+        let ptr = unsafe { &this.ptr.as_ref().value as *const _ as *mut _ };
         mem::forget(this);
         ptr
     }
@@ -306,12 +277,19 @@ impl<T> Rc<T> {
     /// // The memory was freed when `x` went out of scope above, so `x_ptr` is now dangling!
     /// ```
     pub unsafe fn from_raw(ptr: *mut T) -> Self {
-        // To find the corresponding pointer to the `RcBox` we need to subtract
-        // the offset of the `value` field from the pointer.
-        #[allow(unused_unsafe)]
-        let offset = offset_of!(RcBox<T>, value);
-        let rcbox = (ptr as *mut u8).offset(-(offset as isize)) as *mut _;
-        Rc { ptr: Shared::new(rcbox) }
+        // Align the unsized value to the end of the RcBox.
+        // Because it is ?Sized, it will always be the last field in memory.
+        let align = align_of_val(&*ptr);
+        let layout = Layout::new::<RcBox<()>>();
+        let offset = (layout.size() + layout.padding_needed_for(align)) as isize;
+
+        // Reverse the offset to find the original RcBox.
+        let rcbox_ptr = set_ptr(ptr as *const T, (ptr as *mut u8).offset(-offset));
+
+        Rc {
+            ptr: NonNull::new_unchecked(rcbox_ptr),
+            phantom: PhantomData,
+        }
     }
 }
 
@@ -335,7 +313,7 @@ impl<T: ?Sized> Rc<T> {
             // manipulated the reference count in the same function.
             assume(!(*(&self.ptr as *const _ as *const *const ())).is_null());
             */
-            &(**self.ptr)
+            self.ptr.as_ref()
         }
     }
 
@@ -409,7 +387,7 @@ impl<T: ?Sized> Rc<T> {
     #[inline]
     pub fn get_mut(this: &mut Self) -> Option<&mut T> {
         if Rc::is_unique(this) {
-            let inner = unsafe { &mut **this.ptr };
+            let inner = unsafe { this.ptr.as_mut() };
             Some(&mut inner.value)
         } else {
             None
@@ -433,9 +411,7 @@ impl<T: ?Sized> Rc<T> {
     /// ```
     #[inline]
     pub fn ptr_eq(this: &Self, other: &Self) -> bool {
-        let this_ptr:  *const RcBox<T> = *this.ptr;
-        let other_ptr: *const RcBox<T> = *other.ptr;
-        this_ptr == other_ptr
+        this.ptr == other.ptr
     }
 }
 
@@ -480,8 +456,7 @@ impl<T: Clone> Rc<T> {
         // reference count is guaranteed to be 1 at this point, and we required
         // the `Rc<T>` itself to be `mut`, so we're returning the only possible
         // reference to the inner value.
-        let inner = unsafe { &mut **this.ptr };
-        &mut inner.value
+        unsafe { &mut this.ptr.as_mut().value }
     }
 }
 
@@ -504,6 +479,15 @@ impl<T: ?Sized> AsRef<T> for Rc<T> {
     fn as_ref(&self) -> &T {
         &**self
     }
+}
+
+#[inline(never)]
+unsafe fn slow_drop<T:?Sized>(ptr: *mut RcBox<T>) {
+    let layout = Layout::for_value(&*ptr);
+    // run destructor of value.
+    ptr::drop_in_place(&mut(*ptr).value);
+    // deallocate the heap allocated memory.
+    alloc::dealloc(ptr as *mut u8, layout);
 }
 
 impl<T: ?Sized> Drop for Rc<T> {
@@ -531,15 +515,12 @@ impl<T: ?Sized> Drop for Rc<T> {
     /// drop(foo);    // Doesn't print anything
     /// drop(foo2);   // Prints "dropped!"
     /// ```
+    #[inline]
     fn drop(&mut self) {
         unsafe {
-            let ptr: *mut RcBox<T> = *self.ptr;
             self.dec_strong();
             if self.strong() == 0 {
-                // run destructor of value.
-                ptr::drop_in_place(&mut (*ptr).value);
-                // deallocate the heap allocated memory.
-                deallocate(ptr as *mut u8, size_of_val(&*ptr))
+                slow_drop(self.ptr.as_ptr());
             }
         }
     }
@@ -563,7 +544,7 @@ impl<T: ?Sized> Clone for Rc<T> {
     #[inline]
     fn clone(&self) -> Rc<T> {
         self.inc_strong();
-        Rc { ptr: self.ptr }
+        Rc { ptr: self.ptr, phantom: PhantomData }
     }
 }
 
@@ -613,36 +594,33 @@ impl<T: ?Sized> From<Box<T>> for Rc<T> {
     fn from(boxed: Box<T>) -> Self {
         unsafe {
             // Compute space to allocate + alignment for `RcBox<T>`.
-            let sizeb  = mem::size_of_val(&*boxed);
-            let alignb = mem::align_of_val(&*boxed);
-            let align  = cmp::max(alignb, mem::align_of::<usize>());
-            let size   = offset_of_unsafe!(RcBox<T>, value) + sizeb;
+            let fake_rcbox_ptr = &*boxed as *const T as *const RcBox<T>;
+            let rcbox_layout = Layout::for_value(&*fake_rcbox_ptr);
 
             // Allocate the space.
-            let alloc  = heap::allocate(size, align);
+            let alloc  = alloc::alloc(rcbox_layout);
 
             // Cast to fat pointer: *mut RcBox<T>.
             let bptr      = Box::into_raw(boxed);
-            let rcbox_ptr = {
-                let mut tmp = bptr;
-                ptr::write(&mut tmp as *mut _ as *mut * mut u8, alloc);
-                tmp as *mut RcBox<T>
-            };
+            let rcbox_ptr = set_ptr(bptr as *const T, alloc);
 
             // Initialize fields of RcBox<T>.
             (*rcbox_ptr).strong.set(1);
-            //(*rcbox_ptr).weak.set(1);
+            let box_layout = Layout::for_value(&*bptr);
             ptr::copy_nonoverlapping(
                 bptr as *const u8,
                 (&mut (*rcbox_ptr).value) as *mut T as *mut u8,
-                sizeb);
+                box_layout.size());
 
-            // Deallocate box, we've already forgotten it.
-            heap::deallocate(bptr as *mut u8, sizeb, alignb);
+            // Deallocate box, Box::into_raw consumed it and we've moved the value
+            alloc::dealloc(bptr as *mut u8, box_layout);
 
             // Yield the Rc:
-            debug_assert_eq!(size, mem::size_of_val(&*rcbox_ptr));
-            Rc { ptr: Shared::new(rcbox_ptr) }
+            debug_assert_eq!(rcbox_layout.size(), mem::size_of_val(&*rcbox_ptr));
+            Rc {
+                ptr: NonNull::new_unchecked(rcbox_ptr),
+                phantom: PhantomData,
+            }
         }
     }
 }
@@ -653,28 +631,29 @@ unsafe fn slice_to_rc<'a, T, U, W, C>(src: &'a [T], cast: C, write_elems: W)
 where U: ?Sized,
       W: FnOnce(&mut [T], &[T]),
       C: FnOnce(*mut RcBox<[T]>) -> *mut RcBox<U> {
-    // Compute space to allocate for `RcBox<U>`.
-    let susize = mem::size_of::<usize>();
-    let aligned_len = 1 + (mem::size_of_val(src) + susize - 1) / susize;
+    // Compute space to allocate for `RcBox<U>` by creating a fake pointer.
+    // (this is how std does it)
+    let fake_rcbox_ptr = src as *const [T] as *const RcBox<[T]>;
+    let layout = Layout::for_value(&*fake_rcbox_ptr);
 
     // Allocate the space.
-    let mut v = Vec::<usize>::with_capacity(aligned_len);
-    let ptr: *mut usize = v.as_mut_ptr();
-    mem::forget(v);
+    let alloc: *mut u8 = alloc::alloc(layout);
 
     // Combine the allocation address and the slice length into a
     // fat pointer to RcBox<[T]>.
-    let rbp = slice::from_raw_parts_mut(ptr as *mut T, src.len())
-                as *mut [T] as *mut RcBox<[T]>;
+    let rcbox_ptr = set_ptr(src as *const [T], alloc);
 
     // Initialize fields of RcBox<[T]>.
-    (*rbp).strong.set(1);
-    write_elems(&mut (*rbp).value, src);
+    (*rcbox_ptr).strong.set(1);
+    write_elems(&mut (*rcbox_ptr).value, src);
 
-    // Recast to RcBox<U> and yield the Rc:
-    let rcbox_ptr = cast(rbp);
-    debug_assert_eq!(aligned_len * susize, mem::size_of_val(&*rcbox_ptr));
-    Rc { ptr: Shared::new(rcbox_ptr) }
+    // cast to the final type (either [T] or str)
+    let rcbox_ptr = cast(rcbox_ptr);
+    debug_assert_eq!(layout.size(), size_of_val(&*rcbox_ptr));
+    Rc {
+        ptr: NonNull::new_unchecked(rcbox_ptr),
+        phantom: PhantomData
+    }
 }
 
 impl<T> From<Vec<T>> for Rc<[T]> {
@@ -714,6 +693,9 @@ impl<'a, T: Clone> From<&'a [T]> for Rc<[T]> {
     /// Constructs a new `Rc<[T]>` by cloning all elements from the shared slice
     /// [`&[T]`][slice]. The length of the reference counted slice will be exactly
     /// the given [slice].
+    ///
+    /// If a call to `clone()` unwinds, already cloned elements and the memory
+    /// for the `Rc` might not be dropped.
     ///
     /// # Examples
     ///
@@ -823,9 +805,6 @@ impl<'a> From<&'a str> for Rc<str> {
     /// This can be useful in doing [string interning], and cache:ing your strings.
     ///
     /// ```
-    /// // For Rc::ptr_eq
-    /// #![feature(ptr_eq)]
-    ///
     /// use strong_rc::Rc;
     ///
     /// use std::collections::HashSet;
@@ -862,6 +841,7 @@ impl<'a> From<&'a str> for Rc<str> {
     /// assert_eq!(Rc::strong_count(&rc_second), 2);
     /// assert_eq!(Rc::strong_count(&rc_third),  2);
     /// assert!(Rc::ptr_eq(&rc_second, &rc_third));
+    /// ```
     ///
     /// [string interning]: https://en.wikipedia.org/wiki/String_interning
     fn from(slice: &'a str) -> Self {
@@ -1048,6 +1028,24 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for Rc<T> {
 
 impl<T: ?Sized> fmt::Pointer for Rc<T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        fmt::Pointer::fmt(&*self.ptr, f)
+        fmt::Pointer::fmt(&self.ptr, f)
     }
 }
+
+/// A hidden place for negative trait tests.
+///
+/// !Sync:
+/// ```compile_fail
+/// use strong_rc::Rc;
+/// fn sync<T:Sync>(_: T) {}
+/// sync(Rc::new(()));
+/// ```
+///
+/// !Send:
+/// ```compile_fail
+/// use strong_rc::Rc;
+/// fn send<T:Send>(_: T) {}
+/// send(Rc::new(()));
+/// ```
+#[allow(unused)]
+struct ThreadsafeTest;
