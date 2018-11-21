@@ -120,6 +120,7 @@
 #![feature(unsize, coerce_unsized)]
 #![feature(specialization)]
 #![feature(allocator_api)]
+#![feature(alloc_layout_extra)]
 
 use std::alloc::{self, Layout};
 use std::borrow;
